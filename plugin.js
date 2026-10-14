@@ -14,17 +14,17 @@
  * 由 修hermes机器人 生成。
  */
 import { host, useValue } from '@hermes/plugin-sdk'
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useSyncExternalStore } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'pdf-reader'
 const PANE_ID = ID + ':pane' // 贡献作用域化的面板 id: <pluginId>:<paneId>
-const DEFAULT_DIR = 'C:/Users/a/Desktop/物理光学'
 
 // ── 面板注册状态（register() 时注入 ctx）──
 let pluginCtx = null
 let paneDisposer = null
 let paneRegistered = false
+let runtimeEpoch = 0
 
 // ── 会话作用域的查看器状态 ──
 const sessionStates = new Map() // sessionKey -> state
@@ -50,16 +50,19 @@ function emit() {
 
 function getSessionState(key) {
   if (!sessionStates.has(key)) {
+    const defaultDir = String(host.state?.cwd?.get?.() || '')
     sessionStates.set(key, {
       open: false, // 该会话离开时面板是否开着（回来时据此恢复）
       tab: 'pdf', // 'pdf' | 'image'
-      dir: DEFAULT_DIR,
-      dirInput: DEFAULT_DIR,
+      dir: defaultDir,
+      dirInput: defaultDir,
       entries: [],
       selected: null, // {name, path}
       blobUrl: '',
       status: '正在读取目录…',
       listOpen: true,
+      fileRequest: 0,
+      dirRequest: 0,
       image: { src: '', alt: '', list: [], index: -1 }
     })
   }
@@ -67,19 +70,21 @@ function getSessionState(key) {
 }
 
 function onSessionChanged(key) {
-  if (!key || key === activeKey) return
+  if (key === activeKey) return
   activeKey = key
-  const s = getSessionState(key)
-  if (s.open) openPane()
+  const s = key ? getSessionState(key) : null
+  if (s?.open) openPane()
   else closePane()
-  emit() // PdfReaderPane 以 activeKey 为 React key → 换会话即重挂载，读新状态
+  emit()
 }
 
 // ── 面板注册/注销 ──
 function openPane() {
-  if (!pluginCtx || paneRegistered) return
-  paneDisposer = pluginCtx.register(PANE_CONTRIBUTION)
-  paneRegistered = true
+  if (!pluginCtx || !activeKey) return
+  if (!paneRegistered) {
+    paneDisposer = pluginCtx.register(PANE_CONTRIBUTION)
+    paneRegistered = true
+  }
   if (activeKey) getSessionState(activeKey).open = true
   try {
     // 清掉历史 Close 记录并把面板带到前台（旧桌面无此 API 则跳过）
@@ -107,8 +112,9 @@ const PANE_CONTRIBUTION = {
   area: 'panes',
   title: '媒体查看器',
   data: {
-    placement: 'right',
-    collapsible: true,
+    placement: 'main',
+    collapsible: false,
+    uncloseable: true,
     // 停靠在对话（workspace）右缘 —— 自己的独立区域，不进文件树所在的侧边栏
     dock: { pane: 'workspace', pos: 'right' },
     revealAliases: ['pdf-reader'],
@@ -119,18 +125,18 @@ const PANE_CONTRIBUTION = {
 }
 
 // ── 图片：收集/切换（作用到当前会话）──
-function collectChatImages() {
+function collectChatImages(root = document) {
   const out = []
-  document.querySelectorAll('[data-slot="aui_zoomable-image"] img').forEach(img => {
+  root.querySelectorAll('[data-slot="aui_zoomable-image"] img, [data-slot="aui_directive-image"] img').forEach(img => {
     const src = img.currentSrc || img.getAttribute('src') || img.src || ''
     if (src) out.push({ src, alt: img.alt || '' })
   })
   return out
 }
 
-function showImage(src, alt) {
+function showImage(src, alt, root) {
   const s = getSessionState(activeKey || 'default')
-  const list = collectChatImages()
+  const list = collectChatImages(root)
   let index = list.findIndex(item => item.src === src)
   if (index < 0) {
     // 点到的图不在已收集列表里（例如被虚拟滚动丢掉）：补进去
@@ -164,14 +170,16 @@ function interceptChatImageClicks(ctx) {
   const onCapture = e => {
     const el = e.target instanceof Element ? e.target : null
     if (!el || typeof el.closest !== 'function') return
-    const wrap = el.closest('[data-slot="aui_zoomable-image"]')
-    if (!wrap) return
-    const img = wrap.querySelector('img')
+    const wrap = el.closest('[data-slot="aui_zoomable-image"], [data-slot="aui_directive-image"]')
+    if (!wrap || !activeKey) return
+    const opener = el.closest('button')
+    if (!opener || !opener.querySelector('img')) return
+    const img = opener.querySelector('img')
     const src = img ? img.currentSrc || img.getAttribute('src') || img.src || '' : ''
     if (!src) return
     e.stopPropagation()
     e.preventDefault()
-    showImage(src, img ? img.alt || '' : '')
+    showImage(src, img ? img.alt || '' : '', wrap.closest('[data-slot="thread"]') || document)
   }
   document.addEventListener('click', onCapture, true)
   // 键盘 ←/→ 在图片页切换上/下一张（输入框里不抢键）
@@ -195,34 +203,36 @@ function interceptChatImageClicks(ctx) {
 
 // ── 跟踪当前聚焦的会话（bot）──
 function watchFocusedSession(ctx) {
-  // focusedSessionOwner 对 bot 聊天可能解析为 null（模糊时 fail-closed），
-  // 所以用 focusedSessionId（聚焦会话的运行时 id，跟随用户在瓦片间切换），
-  // 它退到 focusedStoredSessionId，再退到单一全局状态。
-  const pick =
-    host.focusedSessionId && typeof host.focusedSessionId.subscribe === 'function'
-      ? host.focusedSessionId
-      : host.focusedStoredSessionId && typeof host.focusedStoredSessionId.subscribe === 'function'
-        ? host.focusedStoredSessionId
-        : null
-  if (!pick) {
-    activeKey = 'default' // 旧桌面无此 API：退化为单一全局状态
+  const state = host.state || {}
+  const pick = state.focusedStoredSessionId || state.focusedSessionId
+  const owner = state.focusedSessionOwner
+  if (typeof pick?.subscribe !== 'function' || typeof owner?.subscribe !== 'function') {
+    host.notify?.({ kind: 'error', message: '媒体查看器：当前桌面缺少完整的会话隔离接口，未启用跨会话查看。' })
     return
   }
-  const unsub = pick.subscribe(id => {
-    const k = id ? String(id) : null
-    if (!k) return // 草稿/未解析：保持当前会话的查看器不变
-    onSessionChanged(k)
-  })
-  if (typeof ctx.onDispose === 'function') ctx.onDispose(unsub)
+  const sync = () => {
+    const id = pick.get()
+    const route = owner.get()
+    const key = id && route?.connectionId && route?.profile
+      ? JSON.stringify([route.connectionId, route.profile, String(id)])
+      : null
+    onSessionChanged(key)
+  }
+  ctx.onDispose(pick.subscribe(sync))
+  ctx.onDispose(owner.subscribe(sync))
 }
 
 // ── 右上角标题栏按钮 ──
 // 样式对齐应用内置 titlebar 图标按钮（titlebarButtonClass + icon-titlebar 尺寸）
 function PdfTitlebarButton() {
+  useSyncExternalStore(subscribeStore, () => version)
   let visible = paneRegistered
   if (typeof host.paneVisibility === 'function') {
     const $v = host.paneVisibility(PANE_ID)
-    if ($v && typeof $v.get === 'function') visible = useValue($v)
+    if ($v && typeof $v.get === 'function') {
+      const inLayout = useValue($v)
+      visible = paneRegistered && inLayout
+    }
   }
 
   return jsx('button', {
@@ -236,8 +246,12 @@ function PdfTitlebarButton() {
         ? 'bg-(--ui-control-hover-background) text-foreground'
         : 'text-muted-foreground/85 hover:bg-(--ui-control-hover-background) hover:text-foreground'),
     onClick: () => {
-      if (paneRegistered) closePane()
+      const onScreen = paneRegistered && (typeof host.paneVisibility === 'function'
+        ? host.paneVisibility(PANE_ID).get()
+        : true)
+      if (onScreen) closePane()
       else openPane()
+      emit()
     },
     children: 'PDF'
   })
@@ -245,8 +259,13 @@ function PdfTitlebarButton() {
 
 function dirUp(p) {
   const norm = String(p || '').replace(/\\/g, '/').replace(/\/+$/, '')
+  if (!norm && p) return '/'
+  if (/^[A-Za-z]:$/.test(norm)) return norm + '/'
+  if (/^\/\/[^/]+\/[^/]+$/.test(norm)) return norm
   const i = norm.lastIndexOf('/')
-  return i > 2 ? norm.slice(0, i) : norm
+  if (i === 0) return '/'
+  if (i === 2 && /^[A-Za-z]:/.test(norm)) return norm.slice(0, 3)
+  return i > 0 ? norm.slice(0, i) : norm
 }
 
 // ── 面板外壳：以会话为 key 重挂载内容 ──
@@ -258,7 +277,11 @@ function PdfReaderPane() {
       children: '未聚焦任何会话'
     })
   }
-  return jsx(PdfSessionView, { sk: activeKey }, activeKey)
+  return jsx('div', {
+    'data-media-viewer': activeKey,
+    className: 'h-full min-h-0',
+    children: jsx(PdfSessionView, { sk: activeKey }, activeKey)
+  })
 }
 
 // ── 单个会话的查看器内容（状态全部存 getSessionState(sk)，天然隔离）──
@@ -268,6 +291,9 @@ function PdfSessionView({ sk }) {
   const loadDir = useCallback(
     async d => {
       const st = getSessionState(sk)
+      const request = ++st.dirRequest
+      const epoch = runtimeEpoch
+      const valid = () => epoch === runtimeEpoch && request === st.dirRequest && sessionStates.get(sk) === st
       st.status = '正在读取目录…'
       st.entries = []
       emit()
@@ -279,6 +305,7 @@ function PdfSessionView({ sk }) {
           return
         }
         const res = await desktop.readDir(d)
+        if (!valid()) return
         if (res && res.error) {
           st.status = '目录读取失败：' + res.error
           emit()
@@ -291,6 +318,7 @@ function PdfSessionView({ sk }) {
         st.status = pdfs.length ? '' : '此目录下没有 PDF 文件'
         emit()
       } catch (e) {
+        if (!valid()) return
         st.status = '目录读取失败：' + ((e && e.message) || String(e))
         emit()
       }
@@ -307,6 +335,9 @@ function PdfSessionView({ sk }) {
   const openFile = useCallback(
     async entry => {
       const st = getSessionState(sk)
+      const request = ++st.fileRequest
+      const epoch = runtimeEpoch
+      const valid = () => epoch === runtimeEpoch && request === st.fileRequest && sessionStates.get(sk) === st
       st.status = '正在加载 ' + entry.name + ' …'
       emit()
       try {
@@ -317,12 +348,14 @@ function PdfSessionView({ sk }) {
           return
         }
         const res = await desktop.readFileDataUrl(entry.path)
+        if (!valid()) return
         if (!res || typeof res !== 'string') {
           st.status = '文件读取失败：' + ((res && (res.message || res.error)) || '未知错误')
           emit()
           return
         }
         const bytes = await (await fetch(res)).arrayBuffer()
+        if (!valid()) return
         const blob = new Blob([bytes], { type: 'application/pdf' })
         const url = URL.createObjectURL(blob)
         if (st.blobUrl) URL.revokeObjectURL(st.blobUrl)
@@ -332,6 +365,7 @@ function PdfSessionView({ sk }) {
         st.listOpen = false // 打开 PDF 后自动收起目录，阅读区占满面板
         emit()
       } catch (e) {
+        if (!valid()) return
         st.status = '打开失败：' + ((e && e.message) || String(e))
         emit()
       }
@@ -339,7 +373,7 @@ function PdfSessionView({ sk }) {
     [sk]
   )
 
-  if (s.tab === 'image' && s.image.src) {
+  if (s.tab === 'image') {
     // ── 图片页 ──
     return jsxs('div', {
       className: 'flex h-full flex-col gap-2 p-2 text-sm',
@@ -415,12 +449,17 @@ function PdfSessionView({ sk }) {
             }),
             jsx('div', {
               className: 'min-h-0 flex-1 overflow-auto rounded border border-(--ui-stroke-secondary)',
-              children: jsx('img', {
-                className: 'mx-auto block max-h-full max-w-full object-contain',
-                src: s.image.src,
-                alt: s.image.alt || '',
-                draggable: false
-              })
+              children: s.image.src
+                ? jsx('img', {
+                    className: 'mx-auto block max-h-full max-w-full object-contain',
+                    src: s.image.src,
+                    alt: s.image.alt || '',
+                    draggable: false
+                  })
+                : jsx('div', {
+                    className: 'flex h-full items-center justify-center p-4 text-xs text-(--ui-text-tertiary)',
+                    children: '点击对话中的图片即可在这里查看。'
+                  })
             })
           ]
         })
@@ -582,14 +621,10 @@ function PdfSessionView({ sk }) {
                         className:
                           'rounded px-2 py-0.5 text-xs text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover)',
                         type: 'button',
-                        onClick: () => {
-                          const desktop = window.hermesDesktop
-                          if (!s.selected || !desktop) return
-                          if (typeof desktop.showItemInFolder === 'function') {
-                            desktop.showItemInFolder(s.selected.path)
-                          } else if (typeof desktop.openExternal === 'function') {
-                            desktop.openExternal('file:///' + String(s.selected.path).replace(/\\/g, '/'))
-                          }
+                        onClick: async () => {
+                          if (!s.selected || !pluginCtx) return
+                          const opened = await pluginCtx.os.revealPath(s.selected.path)
+                          if (!opened) host.notify?.({ kind: 'error', message: '无法在系统文件管理器中显示该文件。' })
                         },
                         title: '在系统中打开',
                         children: '外部打开'
@@ -629,6 +664,7 @@ export default {
   id: ID,
   name: '媒体查看器',
   register(ctx) {
+    const epoch = ++runtimeEpoch
     pluginCtx = ctx
 
     // 右上角标题栏按钮（固定 chrome 槽位，渲染在内置按钮之后 = 最右上角）
@@ -647,15 +683,17 @@ export default {
     // 插件卸载：统一吊销所有会话的 PDF blob
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(() => {
+        if (runtimeEpoch !== epoch) return
+        runtimeEpoch++
         sessionStates.forEach(st => {
-          if (st.blobUrl) {
-            try {
-              URL.revokeObjectURL(st.blobUrl)
-            } catch (e) {
-              /* 忽略 */
-            }
-          }
+          if (st.blobUrl) URL.revokeObjectURL(st.blobUrl)
         })
+        sessionStates.clear()
+        paneRegistered = false
+        paneDisposer = null
+        activeKey = null
+        pluginCtx = null
+        emit()
       })
     }
 

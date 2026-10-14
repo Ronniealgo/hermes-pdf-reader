@@ -1,0 +1,19 @@
+{
+  "name": "hermes-pdf-reader",
+  "version": "1.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check plugin.js"
+  },
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "devDependencies": {
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "jsdom": "29.1.1",
+    "nanostores": "1.4.2"
+  }
+}
